@@ -40,6 +40,17 @@ Hands-On Machine Learning for Algorithmic Trading is for data analysts, data sci
 
 With the following software and hardware list you can run all code files present in the book (Chapter 1-15).
 
+### Additional module: peak and trough forecasting for options
+
+[`peak_trough_options/`](peak_trough_options/README.md) is a self-contained
+module built on the ideas in the book. It forecasts the distribution of the
+maximum favourable and adverse excursion over an option's life -- how far price
+travels up, how far down, and when -- and ranks option structures against those
+bands. It uses purged walk-forward validation, split-conformal quantile
+calibration, and benchmarks everything against climatology. Run
+`python -m peak_trough_options.cli --demo --validate` to try it without any
+data. Educational research code, not investment advice.
+
 ### Software and Hardware List
 
 | Chapter       | Software required                   | OS required                        |
