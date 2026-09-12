@@ -42,22 +42,27 @@ room a contract needs.
 ## Quick start
 
 ```bash
+pip install -r peak_trough_options/requirements.txt
+
+# Download from Yahoo Finance and validate, with the implied vol from the chain
+python -m peak_trough_options.cli --ticker AAPL --start 2005-01-01 --iv 0.32 --validate
+
 # No network or data needed — synthetic bars, end to end
 python -m peak_trough_options.cli --demo --validate
 
-# Your own OHLCV csv, with the implied vol from the real option chain
-python -m peak_trough_options.cli --csv AAPL.csv --horizon 30 --iv 0.32 --validate
+# Your own OHLCV csv
+python -m peak_trough_options.cli --csv AAPL.csv --horizon 30 --iv 0.32
 
-# Pull daily bars from stooq (needs pandas-datareader)
-python -m peak_trough_options.cli --ticker AAPL.US --horizon 21 --iv 0.28
+# Stooq instead of Yahoo (needs pandas-datareader)
+python -m peak_trough_options.cli --ticker AAPL.US --source stooq
 ```
 
 As a library:
 
 ```python
-from peak_trough_options import load_csv, run
+from peak_trough_options import load_yfinance, run
 
-bars = load_csv('AAPL.csv')                       # date, open, high, low, close[, volume]
+bars = load_yfinance('AAPL', start='2005-01-01')  # split/dividend adjusted
 view = run(bars, horizon=21, implied_sigma_annual=0.32)
 
 print(view['targets'])            # peak / trough / expiry price at each quantile
@@ -177,6 +182,43 @@ Verdict: No edge: the model does not beat training-window climatology.
 That is the honest outcome on the synthetic demo data, and it is a common
 outcome on real tickers. The code says so rather than burying it.
 
+### Measured on real data
+
+Yahoo daily bars, 2005 to present, 21-day horizon, 5 purged walk-forward folds,
+`min_train=1250`. Roughly 4,100 out-of-sample bars per name (2,800 for TSLA).
+
+| Ticker | Quantile skill | Worst coverage error | `upside_touch` AUC | vs climatology | `big_move` AUC | vs climatology |
+| --- | --- | --- | --- | --- | --- | --- |
+| SPY | −0.025 | 0.043 | 0.569 | 0.487 | 0.554 | 0.482 |
+| AAPL | −0.028 | 0.052 | 0.597 | 0.482 | 0.608 | 0.477 |
+| MSFT | −0.002 | 0.032 | 0.634 | 0.507 | 0.566 | 0.498 |
+| TSLA | −0.035 | 0.048 | 0.492 | 0.467 | 0.513 | 0.443 |
+
+Three things to take from this, in order of confidence:
+
+**Calibration holds up on real data.** Worst coverage error is 0.03–0.05 and the
+80% interval covers 74–78%, against 0.08 on synthetic bars. The conformal step
+has ~4,000 training rows to work with here, which is what it needs.
+
+**The full quantile band does not beat climatology.** Skill is mildly negative
+everywhere (MSFT's `mfe` is the one positive at +0.023). If what you want is the
+whole band, use the climatology band — the module reports this itself and tells
+you so.
+
+**The upside-touch question does show ranking power.** "Will the high reach +1σ
+before expiry" is the most options-relevant of the four decisions, and it beats
+climatology on AUC for three of the four names, with a *better* Brier score too
+(SPY 0.232 vs 0.237, AAPL 0.243 vs 0.247, MSFT 0.225 vs 0.235). MSFT at 0.634 is
+well clear of chance.
+
+Treat that last one as a lead, not a result. It is 16 comparisons (four tickers ×
+four decisions), so a couple landing high is expected from noise alone; what
+makes it interesting is that the *same* decision wins on three names and improves
+calibration at the same time. Before trading it: test more names, more horizons,
+and out-of-sample periods these runs never touched. Note also that
+`lift_over_majority` is negative even where AUC is good — the ranking is what has
+value here, not the thresholded label.
+
 ### Confusion matrices
 
 The model is a quantile regressor, but every real use of it collapses the
@@ -227,9 +269,11 @@ by 20 days: 1,500 training rows carry roughly `1500 / 21 ≈ 70` independent
 observations. The default hyperparameters are deliberately heavily regularised
 for that reality. If you loosen them, watch the interval coverage collapse.
 
-Practical minimum: about **2,500 daily bars (10 years)** for a 21-day horizon.
-Below roughly 1,500 the conformal calibration switches itself off and the bands
-revert to being too narrow. `fit` refuses outright below 250 labelled rows.
+Practical minimum: about **2,500 daily bars (10 years)** for a 21-day horizon;
+the real-data runs above used 5,400. Below roughly 1,500 the conformal
+calibration switches itself off and the bands revert to being too narrow. `fit`
+refuses outright below 250 labelled rows. `--start 2005-01-01` is a reasonable
+default for a liquid US name.
 
 ---
 
@@ -237,7 +281,7 @@ revert to being too narrow. `fit` refuses outright below 250 labelled rows.
 
 | File | Contents |
 | --- | --- |
-| `data.py` | CSV / stooq loading, column normalisation, bar validation, synthetic generator |
+| `data.py` | Yahoo Finance / stooq / CSV loading, column normalisation, bar validation, synthetic generator |
 | `swings.py` | Wilder ATR, ATR-scaled zig-zag pivots with confirmation lag, swing features |
 | `features.py` | ~50 causal features: momentum, volatility estimators, range position, variance ratios, trend quality, oscillators, volume |
 | `labels.py` | Forward extremes and their volatility-scaled forms |
@@ -274,8 +318,17 @@ was fitted on, and implied vol is elevated for a reason the model cannot see.
 Do not use this across an earnings date without handling that yourself.
 
 **Survivorship and corporate actions.** Feed it split- and dividend-adjusted
-prices. Unadjusted series produce fake gaps that the swing detector will read as
-genuine reversals.
+prices. `load_yfinance` requests `auto_adjust=True` for exactly this reason and
+warns if you turn it off; unadjusted series produce fake gaps on every split and
+ex-dividend date that the swing detector reads as genuine reversals.
+
+**Yahoo data is free, and priced accordingly.** It carries occasional bad prints
+and revises history without notice, and it is not a survivorship-bias-free
+universe — a delisted ticker simply is not there, so any study you build by
+picking symbols that exist today is already biased. `normalise_ohlcv` repairs
+float-level rounding in adjusted bars (real Yahoo history is off by an ULP a
+couple of times per decade) but refuses anything larger, which catches gross
+corruption and nothing subtler.
 
 **Regime change.** Fitted on history, applied to the future. Every calibration
 number above is measured on the past. The 2020 volatility spike was outside any

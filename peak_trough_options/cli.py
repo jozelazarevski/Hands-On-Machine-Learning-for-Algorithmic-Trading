@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """Command line front end.
 
+    python -m peak_trough_options.cli --ticker AAPL --iv 0.32 --validate
     python -m peak_trough_options.cli --csv AAPL.csv --horizon 21
-    python -m peak_trough_options.cli --ticker AAPL.US --iv 0.32 --validate
     python -m peak_trough_options.cli --demo --validate
 """
 
@@ -32,7 +32,7 @@ def build_parser():
                     'and rank structures against it.')
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument('--csv', help='OHLCV csv file')
-    source.add_argument('--ticker', help='symbol to pull from stooq, e.g. AAPL.US')
+    source.add_argument('--ticker', help='symbol to download, e.g. AAPL')
     source.add_argument('--demo', action='store_true',
                         help='run on synthetic bars, no network needed')
 
@@ -48,7 +48,11 @@ def build_parser():
     parser.add_argument('--dividend', type=float, default=0.0, help='dividend yield')
     parser.add_argument('--spread', type=float, default=0.01,
                         help='option bid-ask width as a fraction of mid')
+    parser.add_argument('--source', choices=('yfinance', 'stooq'),
+                        default='yfinance',
+                        help='where --ticker is downloaded from (default: yfinance)')
     parser.add_argument('--start', default='2010-01-01', help='history start for --ticker')
+    parser.add_argument('--end', default=None, help='history end for --ticker')
     parser.add_argument('--half-life', type=int, default=None,
                         help='sample-weight half life in bars')
     parser.add_argument('--top', type=int, default=6, help='structures to show')
@@ -73,7 +77,9 @@ def load_bars(args):
         return data.synthetic_ohlcv(n=2600, seed=7)
     if args.csv:
         return data.load_csv(args.csv)
-    return data.load_stooq(args.ticker, start=args.start)
+    if args.source == 'stooq':
+        return data.load_stooq(args.ticker, start=args.start, end=args.end)
+    return data.load_yfinance(args.ticker, start=args.start, end=args.end)
 
 
 def run_validation(df, args):
