@@ -12,7 +12,7 @@ import sys
 
 import pandas as pd
 
-from . import backtest, data, pipeline
+from . import backtest, classification, data, pipeline
 
 DISCLAIMER = (
     'Research and educational output only. These are model estimates from '
@@ -59,6 +59,11 @@ def build_parser():
                         help='minimum training bars per fold')
     parser.add_argument('--simulate', action='store_true',
                         help='replay top-ranked structures (needs --validate)')
+    parser.add_argument('--sigma-threshold', type=float, default=1.0,
+                        help='how far the touch and big-move thresholds sit '
+                             'from spot, in volatility units (default: 1.0)')
+    parser.add_argument('--no-confusion', action='store_true',
+                        help='skip the confusion matrices during --validate')
     return parser
 
 
@@ -98,6 +103,9 @@ def run_validation(df, args):
     for warning in assessment['warnings']:
         print(f'  warning: {warning}')
 
+    if not args.no_confusion:
+        report_confusion(oos, args)
+
     if args.simulate:
         _print_header('Decision replay (diagnostic only)')
         sweep = backtest.vrp_sensitivity(oos, df, horizon=args.horizon,
@@ -110,6 +118,31 @@ def run_validation(df, args):
             print('\nIf the sign of total_profit flips across this sweep, the '
                   'result reflects the volatility assumption, not the forecast.')
     return oos
+
+
+def report_confusion(oos, args):
+    _print_header('Confusion matrices for the decisions the forecast implies')
+    report = classification.classification_report(
+        oos, sigma=args.sigma_threshold)
+
+    for task, entry in report.items():
+        title = (f"{task}  --  {entry['question']}?  "
+                 f"(call it yes when p > {entry['threshold']:.2f})")
+        print()
+        print(classification.format_confusion(entry['confusion'], title,
+                                              normalise=True))
+
+    print('\nScores, against the same climatology baseline used above:')
+    summary = classification.summarise_report(report)
+    print(summary.to_string(index=False, float_format=lambda v: f'{v:.3f}'))
+
+    assessment = classification.classification_verdict(report)
+    print(f"\nVerdict: {assessment['headline']}")
+    for note in assessment['notes']:
+        print(f'  - {note}')
+    print('\nA confusion matrix hides calibration, so read roc_auc and brier')
+    print('alongside it: a forecast can rank well and still lose to always')
+    print('guessing the majority class when the base rate is lopsided.')
 
 
 def report(view, args):

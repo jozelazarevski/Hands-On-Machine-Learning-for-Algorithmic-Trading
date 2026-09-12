@@ -177,6 +177,49 @@ Verdict: No edge: the model does not beat training-window climatology.
 That is the honest outcome on the synthetic demo data, and it is a common
 outcome on real tickers. The code says so rather than burying it.
 
+### Confusion matrices
+
+The model is a quantile regressor, but every real use of it collapses the
+distribution into a choice. `--validate` prints a confusion matrix for each of
+those choices, with the probability read straight off the forecast:
+
+| Task | Question | Drives |
+| --- | --- | --- |
+| `direction` | does it close above today by expiry | calls vs puts |
+| `upside_touch` | does the high reach +1σ before expiry | call strike, profit target |
+| `downside_touch` | does the low reach −1σ before expiry | put strike, stop, short-put safety |
+| `big_move` | does it move more than 1σ either way | straddle vs credit spread |
+
+Thresholds are in units of the volatility scale (`--sigma-threshold`), so they
+stay comparable across assets and regimes.
+
+Two things about reading these matrices:
+
+**The cut is not 0.5.** Under a normal, the chance of a 1σ move is about 0.32,
+so an honest forecast of a rare event never crosses 0.5 and the matrix
+collapses into a single column — accurate, and useless. Each task is therefore
+cut at the model's own mean predicted probability ("flag the setups this model
+rates above its own average"), which is derived only from the predictions and
+so cannot leak. The cut used is printed in the header of every matrix.
+
+**Accuracy is the wrong headline.** With a 25% base rate, always answering "no"
+scores 75%. The columns that matter are `lift_over_majority` (accuracy above
+that free lunch), `roc_auc` versus `baseline_roc_auc` (does the *ranking* beat
+climatology), and `brier` versus `baseline_brier` (is it better calibrated).
+A forecast can rank usefully and still lose the accuracy contest, which is why
+the verdict reports those separately:
+
+```
+Verdict: No usable classification: no decision ranks better out of sample
+         than climatology does.
+  - direction: the ranking is no better than a coin toss (AUC 0.46)
+  - direction: climatology is better calibrated (Brier 0.250 vs 0.291)
+```
+
+Again, that is the honest reading of the synthetic demo data, and it agrees
+with the negative pinball skill above. Two independent evaluations pointing the
+same way is the system working.
+
 ### Effective sample size
 
 This is the thing that bites hardest. With `H = 21`, consecutive labels overlap
@@ -203,6 +246,7 @@ revert to being too narrow. `fit` refuses outright below 250 labelled rows.
 | `model.py` | `PeakTroughForecaster` — quantile GBM per target and level, with split-conformal calibration |
 | `options.py` | Black–Scholes with dividends, greeks, implied vol, nine structures, EV scoring, ranking |
 | `backtest.py` | Walk-forward evaluation, calibration tables, plain-language `verdict`, decision replay, volatility sensitivity sweep |
+| `classification.py` | Confusion matrices and threshold/probabilistic scores for the discrete decisions the forecast implies |
 | `pipeline.py` | `prepare` → `fit` → `latest_forecast` → `recommend` |
 | `cli.py` | Command line front end |
 
@@ -256,4 +300,5 @@ python -m pytest peak_trough_options/tests -q
 The suite covers the causality guarantees, label correctness against a naive
 reference implementation, splitter purging, Black–Scholes against put-call
 parity and finite-difference greeks, the reflection-principle formula against
-Monte Carlo, and end-to-end calibration.
+Monte Carlo, confusion-matrix counting and scoring, and end-to-end
+calibration.
