@@ -184,42 +184,96 @@ outcome on real tickers. The code says so rather than burying it.
 
 ### Measured on real data
 
-Yahoo daily bars, 2005 to present, 21-day horizon, 5 purged walk-forward folds,
-`min_train=1250`. Roughly 4,100 out-of-sample bars per name (2,800 for TSLA).
+Yahoo daily bars, 2005 to present, 21-day horizon, 4-5 purged walk-forward
+folds, ~4,100 out-of-sample bars per name.
 
-| Ticker | Quantile skill | Worst coverage error | `upside_touch` AUC | vs climatology | `big_move` AUC | vs climatology |
-| --- | --- | --- | --- | --- | --- | --- |
-| SPY | −0.025 | 0.043 | 0.569 | 0.487 | 0.554 | 0.482 |
-| AAPL | −0.028 | 0.052 | 0.597 | 0.482 | 0.608 | 0.477 |
-| MSFT | −0.002 | 0.032 | 0.634 | 0.507 | 0.566 | 0.498 |
-| TSLA | −0.035 | 0.048 | 0.492 | 0.467 | 0.513 | 0.443 |
+**Calibration holds up.** Worst coverage error is 0.03–0.05 and the 80%
+interval covers 74–78%, against 0.08 on synthetic bars. The conformal step has
+~4,000 rows to work with here, which is what it needs.
 
-Three things to take from this, in order of confidence:
+**Nothing beats the benchmarks.** Quantile skill is mildly negative on every
+name tried (−0.035 to −0.002). None of the four decisions ranks better than
+both references once the references are fair. The module reports this itself
+and tells you to trade the climatology band instead.
 
-**Calibration holds up on real data.** Worst coverage error is 0.03–0.05 and the
-80% interval covers 74–78%, against 0.08 on synthetic bars. The conformal step
-has ~4,000 training rows to work with here, which is what it needs.
+#### A false positive worth keeping on the record
 
-**The full quantile band does not beat climatology.** Skill is mildly negative
-everywhere (MSFT's `mfe` is the one positive at +0.023). If what you want is the
-whole band, use the climatology band — the module reports this itself and tells
-you so.
+An earlier pass on SPY, AAPL, MSFT and TSLA showed `upside_touch` — "does the
+high reach +1σ before expiry" — beating climatology on AUC for three of four
+names, with a better Brier score too. That looked like the one real edge in the
+module. It was not, and the way it fell apart is the most useful thing in this
+README.
 
-**The upside-touch question does show ranking power.** "Will the high reach +1σ
-before expiry" is the most options-relevant of the four decisions, and it beats
-climatology on AUC for three of the four names, with a *better* Brier score too
-(SPY 0.232 vs 0.237, AAPL 0.243 vs 0.247, MSFT 0.225 vs 0.235). MSFT at 0.634 is
-well clear of chance.
+Two checks killed it:
 
-Treat that last one as a lead, not a result. It is 16 comparisons (four tickers ×
-four decisions), so a couple landing high is expected from noise alone; what
-makes it interesting is that the *same* decision wins on three names and improves
-calibration at the same time. Before trading it: test more names, more horizons,
-and out-of-sample periods these runs never touched. Note also that
-`lift_over_majority` is negative even where AUC is good — the ranking is what has
-value here, not the thresholded label.
+**A single feature beat the entire model.** `-vol_ratio_10_63` — short-horizon
+volatility over long-horizon volatility, one column, no fitting, no model —
+scores AUC 0.54–0.65 on the same task:
 
-### Confusion matrices
+| | SPY | AAPL | MSFT | TSLA |
+| --- | --- | --- | --- | --- |
+| Full gradient-boosted model | 0.569 | 0.597 | 0.634 | 0.492 |
+| One volatility feature, no model | 0.593 | 0.646 | 0.641 | 0.617 |
+
+**The edge vanished at an absolute threshold.** `studies/upside_touch_study.py`
+re-ran the question as "does the high reach +5%" rather than "+1σ", on twelve
+tickers the exploratory pass never touched, scoring against two references —
+climatology, and a random walk that already knows today's volatility. Wins are
+against whichever reference is harder; the p-value is a one-sided sign test.
+
+| Task | σ-scaled threshold | Absolute ±5% threshold |
+| --- | --- | --- |
+| `upside_touch` | **12/12 names, +0.077, p = 0.0002** | 3/12, −0.018, p = 0.98 |
+| `big_move` | **12/12 names, +0.065, p = 0.0002** | 1/12, −0.023, p = 1.00 |
+| `downside_touch` | 0/12, −0.057 | 3/12, −0.007, p = 0.98 |
+| `direction` | 7/12, +0.003, p = 0.39 | 7/12, +0.003, p = 0.39 |
+
+The σ-scaled result is about as clean as a backtest ever looks: every single
+name, in the same direction, at p = 0.0002. It is also entirely an artifact.
+Move the threshold into return space and the same model on the same data loses
+to the benchmark on nine names out of twelve, with a *negative* mean advantage.
+
+`direction` is the control. Its threshold is zero, so it is scale-free, and it
+reads the same under both rules — no artifact to gain, and no real edge either.
+
+The mechanism is circularity in the label. A σ-scaled threshold asks whether
+the excursion beat the EWMA volatility estimate that the label was **divided
+by**. That estimate mean-reverts, so when short-horizon volatility sits below
+long-horizon volatility, `sigma_t` is too small and the *scaled* excursion is
+inflated — regardless of what the price does. Any feature comparing short to
+long volatility predicts that. It is a statement about the denominator, not
+about the asset.
+
+The giveaway was visible before the confirmation run: the σ-threshold tasks
+all moved together, while `direction` — scale-free — did not. A model with
+genuine directional information would not lift upside and downside alike.
+
+The lesson generalises past this module. A p-value of 0.0002 across twelve
+independent-looking names did not mean the signal was real; it meant the
+artifact was reliable. Nothing about the walk-forward, the purging or the
+sample size protects against a label defined in terms of a quantity the
+features can predict for unrelated reasons. Only changing the question did.
+
+Two changes came out of it, both kept:
+
+* `classification_report(oos, absolute=0.05)` puts the threshold in return
+  space, where the label no longer depends on the model's own scale estimate.
+* Every task is now also scored against a **same-volatility random walk**
+  (`gbm_touch_probability`, closed form from the reflection principle). It is
+  handed the current volatility and asked the same question, so beating it
+  requires information beyond the volatility level — which is the only bar
+  worth clearing. `classification_verdict` requires the model to beat
+  whichever reference is harder.
+
+The random walk also diagnoses the artifact directly: under a σ-scaled
+threshold it returns nearly the same number for every bar, because threshold
+and volatility move together. A benchmark that cannot discriminate is the sign
+that the task is asking about the estimator rather than the asset.
+
+`studies/upside_touch_study.py` reruns the whole thing, both threshold modes,
+on twenty tickers the exploratory pass never touched.
+
+### Confusion matrices### Confusion matrices
 
 The model is a quantile regressor, but every real use of it collapses the
 distribution into a choice. `--validate` prints a confusion matrix for each of

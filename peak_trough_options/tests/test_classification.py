@@ -218,3 +218,77 @@ def test_verdict_refuses_to_credit_a_model_climatology_matches():
     assessment = cl.classification_verdict(report)
     assert 'No usable classification' in assessment['headline']
     assert any('add nothing' in note for note in assessment['notes'])
+
+
+# -- absolute thresholds and the random-walk baseline ----------------------
+
+def test_absolute_thresholds_scale_with_volatility(oos):
+    """A fixed 5% move is a different number of sigmas on every bar."""
+    scaled = cl.thresholds_in_scaled_space(oos, sigma=1.0)
+    absolute = cl.thresholds_in_scaled_space(oos, absolute=0.05)
+    assert np.allclose(scaled, 1.0)
+    assert absolute.std() > 0
+    np.testing.assert_allclose(absolute * oos['scale'].to_numpy(), 0.05)
+
+
+def test_absolute_outcomes_match_the_raw_returns(oos):
+    _, outcome = cl.decision_probabilities(oos, absolute=0.05)
+    np.testing.assert_array_equal(outcome['upside_touch'],
+                                  oos['mfe_true'].to_numpy() >= 0.05)
+    np.testing.assert_array_equal(outcome['downside_touch'],
+                                  oos['mae_true'].to_numpy() <= -0.05)
+
+
+def test_random_walk_baseline_barely_moves_for_a_sigma_threshold(oos):
+    """The tell that a sigma-scaled task is about the estimator, not the asset.
+
+    Threshold and volatility move together, so the random walk answers very
+    nearly the same number on every bar and has almost nothing left to rank
+    on.  Measured: standard deviation around 0.011 scaled versus 0.19
+    absolute, an order of magnitude apart.
+    """
+    scaled = cl.random_walk_probabilities(oos, sigma=1.0)
+    absolute = cl.random_walk_probabilities(oos, absolute=0.05)
+    for task in ('upside_touch', 'downside_touch', 'big_move'):
+        assert scaled[task].std() < 0.02, task
+        assert absolute[task].std() > 10 * scaled[task].std(), task
+
+
+def test_random_walk_baseline_varies_for_an_absolute_threshold(oos):
+    walk = cl.random_walk_probabilities(oos, absolute=0.05)
+    assert walk['upside_touch'].std() > 0.01
+    for task in ('upside_touch', 'downside_touch', 'big_move'):
+        assert np.all((walk[task] >= 0) & (walk[task] <= 1))
+    assert np.allclose(walk['direction'], 0.5)
+
+
+def test_random_walk_touch_probability_rises_with_volatility(oos):
+    walk = cl.random_walk_probabilities(oos, absolute=0.05)
+    scale = oos['scale'].to_numpy()
+    # More volatile bars must be likelier to travel a fixed distance.
+    assert np.corrcoef(scale, walk['upside_touch'])[0, 1] > 0.9
+
+
+def test_report_carries_all_three_references(oos):
+    report = cl.classification_report(oos, absolute=0.05)
+    summary = cl.summarise_report(report)
+    for column in ('roc_auc', 'baseline_roc_auc', 'randomwalk_roc_auc',
+                   'brier', 'baseline_brier', 'randomwalk_brier'):
+        assert column in summary
+    assert summary['randomwalk_roc_auc'].notna().any()
+    assert '5.0%' in report['upside_touch']['question']
+
+
+def test_verdict_defers_to_whichever_baseline_is_harder():
+    """Climatology weak, random walk strong: the model must still lose."""
+    report = {'upside_touch': {
+        'question': 'q', 'threshold': 0.5,
+        'scores': {'n': 100, 'base_rate': 0.5, 'accuracy': 0.6,
+                   'majority_accuracy': 0.5, 'lift_over_majority': 0.1,
+                   'balanced_accuracy': 0.6, 'mcc': 0.1, 'roc_auc': 0.58,
+                   'brier': 0.24},
+        'baseline_scores': {'roc_auc': 0.50, 'brier': 0.25},
+        'random_walk_scores': {'roc_auc': 0.62, 'brier': 0.23}}}
+    assessment = cl.classification_verdict(report)
+    assert 'No usable classification' in assessment['headline']
+    assert any('random walk' in note for note in assessment['notes'])

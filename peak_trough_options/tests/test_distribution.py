@@ -8,7 +8,9 @@ from scipy.stats import norm
 
 from peak_trough_options.distribution import (QuantileDistribution, coverage,
                                               gbm_excursion_quantiles,
+                                              gbm_move_probability,
                                               gbm_running_max_quantiles,
+                                              gbm_touch_probability,
                                               monotone_rearrange, pinball_loss)
 
 LEVELS = np.array([0.10, 0.25, 0.50, 0.75, 0.90])
@@ -103,13 +105,13 @@ def test_pinball_and_coverage():
 def test_running_max_matches_simulation():
     sigma, horizon = 0.02, 21
     rng = np.random.default_rng(5)
-    substeps = 60
+    substeps = 25
     paths = rng.normal(0, sigma / np.sqrt(substeps),
-                       size=(60000, horizon * substeps)).cumsum(axis=1)
+                       size=(20000, horizon * substeps)).cumsum(axis=1)
     simulated = np.quantile(np.maximum(paths.max(axis=1), 0.0), LEVELS)
     closed_form = gbm_running_max_quantiles(LEVELS, 0.0, sigma, horizon)
     # Discrete sub-stepping biases the simulation slightly low.
-    np.testing.assert_allclose(closed_form, simulated, atol=0.004)
+    np.testing.assert_allclose(closed_form, simulated, atol=0.008)
 
 
 def test_excursions_are_mirrored_without_drift():
@@ -118,3 +120,56 @@ def test_excursions_are_mirrored_without_drift():
     down = -np.log1p(result['mae'])[::-1]
     np.testing.assert_allclose(up, down, rtol=1e-6)
     assert np.all(result['mfe'] >= 0) and np.all(result['mae'] <= 0)
+
+
+# -- closed-form touch probabilities ---------------------------------------
+
+@pytest.fixture(scope='module')
+def simulated_paths():
+    # Kept small on purpose: the full (paths x steps) matrix is materialised
+    # twice by cumsum, so a generous simulation here costs gigabytes.
+    rng = np.random.default_rng(17)
+    sigma, horizon, substeps = 0.02, 21, 25
+    steps = rng.normal(0, sigma / np.sqrt(substeps),
+                       size=(20000, horizon * substeps)).cumsum(axis=1)
+    return sigma, horizon, steps
+
+
+@pytest.mark.parametrize('move', [0.03, 0.05, 0.08])
+def test_touch_probability_matches_simulation(simulated_paths, move):
+    sigma, horizon, steps = simulated_paths
+    up = np.mean(np.expm1(steps.max(axis=1)) >= move)
+    down = np.mean(np.expm1(steps.min(axis=1)) <= -move)
+    # Sub-stepping misses part of the true continuous extreme, biasing low.
+    assert gbm_touch_probability(move, sigma, horizon) == pytest.approx(up, abs=0.035)
+    assert gbm_touch_probability(-move, sigma, horizon, kind='down') == \
+        pytest.approx(down, abs=0.035)
+
+
+def test_move_probability_matches_simulation(simulated_paths):
+    sigma, horizon, steps = simulated_paths
+    terminal = np.expm1(steps[:, -1])
+    for move in (0.03, 0.05, 0.08):
+        assert gbm_move_probability(move, sigma, horizon) == \
+            pytest.approx(np.mean(np.abs(terminal) >= move), abs=0.02)
+
+
+def test_touch_probability_falls_as_the_move_grows():
+    probs = [gbm_touch_probability(m, 0.02, 21) for m in (0.02, 0.05, 0.10, 0.20)]
+    assert probs == sorted(probs, reverse=True)
+    assert all(0.0 <= p <= 1.0 for p in probs)
+
+
+def test_touch_probability_rises_with_volatility():
+    probs = [gbm_touch_probability(0.05, v, 21) for v in (0.005, 0.01, 0.02, 0.04)]
+    assert probs == sorted(probs)
+
+
+def test_a_threshold_already_reached_is_certain():
+    assert gbm_touch_probability(-0.01, 0.02, 21, kind='up') == 1.0
+    assert gbm_touch_probability(0.01, 0.02, 21, kind='down') == 1.0
+
+
+def test_touch_probability_rejects_a_bad_direction():
+    with pytest.raises(ValueError):
+        gbm_touch_probability(0.05, 0.02, 21, kind='sideways')

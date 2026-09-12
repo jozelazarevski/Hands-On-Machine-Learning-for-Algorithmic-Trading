@@ -193,3 +193,34 @@ def gbm_excursion_quantiles(levels, sigma_daily, horizon, mu_daily=0.0):
     # min of X with drift mu == -(max of X with drift -mu), with levels flipped
     min_log = -gbm_running_max_quantiles(1 - levels, -mu_daily, sigma_daily, horizon)
     return {'mfe': np.expm1(max_log), 'mae': np.expm1(min_log)}
+
+
+def gbm_touch_probability(threshold, sigma_daily, horizon, mu_daily=0.0, kind='up'):
+    """P(the path touches ``threshold`` (a simple return) within ``horizon``).
+
+    Closed form from the reflection principle, for a driftless-by-default
+    geometric Brownian motion of the given daily volatility.  This is the
+    reference an excursion forecast has to beat to have said anything: it
+    already knows how volatile the asset is right now, so beating it requires
+    information beyond the current volatility level.
+    """
+    log_threshold = np.log1p(threshold)
+    if kind == 'up':
+        if log_threshold <= 0:
+            return 1.0
+        return 1.0 - _running_max_cdf(log_threshold, mu_daily, sigma_daily, horizon)
+    if kind == 'down':
+        if log_threshold >= 0:
+            return 1.0
+        # The minimum of X with drift mu mirrors the maximum of -X with -mu.
+        return 1.0 - _running_max_cdf(-log_threshold, -mu_daily, sigma_daily, horizon)
+    raise ValueError("kind must be 'up' or 'down'")
+
+
+def gbm_move_probability(threshold, sigma_daily, horizon, mu_daily=0.0):
+    """P(|terminal return| >= ``threshold``) under the same random walk."""
+    log_threshold = abs(np.log1p(abs(threshold)))
+    spread = sigma_daily * np.sqrt(horizon)
+    drift = mu_daily * horizon
+    return float(norm.sf((log_threshold - drift) / spread)
+                 + norm.cdf((-log_threshold - drift) / spread))

@@ -64,8 +64,14 @@ def build_parser():
     parser.add_argument('--simulate', action='store_true',
                         help='replay top-ranked structures (needs --validate)')
     parser.add_argument('--sigma-threshold', type=float, default=1.0,
-                        help='how far the touch and big-move thresholds sit '
-                             'from spot, in volatility units (default: 1.0)')
+                        help='touch/big-move threshold in volatility units '
+                             '(default: 1.0). Prefer --touch-pct: a '
+                             'volatility-scaled threshold makes the label '
+                             'depend on the same volatility estimate the '
+                             'labels were divided by, which flatters the model')
+    parser.add_argument('--touch-pct', type=float, default=None,
+                        help='use a fixed return threshold instead, e.g. 0.05 '
+                             'for a 5%% move (recommended)')
     parser.add_argument('--no-confusion', action='store_true',
                         help='skip the confusion matrices during --validate')
     return parser
@@ -129,7 +135,12 @@ def run_validation(df, args):
 def report_confusion(oos, args):
     _print_header('Confusion matrices for the decisions the forecast implies')
     report = classification.classification_report(
-        oos, sigma=args.sigma_threshold)
+        oos, sigma=args.sigma_threshold, absolute=args.touch_pct)
+    if args.touch_pct is None:
+        print('Thresholds are volatility-scaled. That makes the label depend on')
+        print('the same volatility estimate the labels were divided by, and the')
+        print('random-walk column below degenerates to a constant as a result.')
+        print('Pass --touch-pct 0.05 for a threshold that asks a real question.')
 
     for task, entry in report.items():
         title = (f"{task}  --  {entry['question']}?  "
@@ -138,7 +149,8 @@ def report_confusion(oos, args):
         print(classification.format_confusion(entry['confusion'], title,
                                               normalise=True))
 
-    print('\nScores, against the same climatology baseline used above:')
+    print('\nScores, against two references: training-window climatology, and')
+    print('a random walk that already knows today\'s volatility.')
     summary = classification.summarise_report(report)
     print(summary.to_string(index=False, float_format=lambda v: f'{v:.3f}'))
 

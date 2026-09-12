@@ -20,7 +20,8 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import matthews_corrcoef, roc_auc_score
 
-from .distribution import QuantileDistribution
+from .distribution import (QuantileDistribution, gbm_move_probability,
+                           gbm_touch_probability)
 from .model import DEFAULT_LEVELS
 
 
@@ -158,9 +159,9 @@ TASK_LABELS = {
 
 TASK_QUESTIONS = {
     'direction': 'does it close above today by expiry',
-    'upside_touch': 'does the high reach +{t} sigma before expiry',
-    'downside_touch': 'does the low reach -{t} sigma before expiry',
-    'big_move': 'does it move more than {t} sigma either way',
+    'upside_touch': 'does the high reach +{t} before expiry',
+    'downside_touch': 'does the low reach -{t} before expiry',
+    'big_move': 'does it move more than {t} either way',
 }
 
 
@@ -180,12 +181,29 @@ def _distributions(oos, levels, suffix=''):
     return out
 
 
-def decision_probabilities(oos, levels=None, sigma=1.0, suffix=''):
+def thresholds_in_scaled_space(oos, sigma=1.0, absolute=None):
+    """The per-row cut-off, expressed in the model's volatility-scaled space.
+
+    With ``absolute`` set (a simple return such as 0.05), the threshold is a
+    fixed economic move and the scaled cut-off varies with volatility.  That
+    matters more than it looks: a sigma-scaled threshold makes the *label*
+    depend on the same EWMA volatility estimate the labels were divided by,
+    and because that estimate mean-reverts, any feature measuring "short vol
+    versus long vol" predicts the label without saying anything about the
+    price path.  An absolute threshold removes that circularity.
+    """
+    if absolute is None:
+        return np.full(len(oos), float(sigma))
+    scale = oos['scale'].to_numpy(dtype=float)
+    return float(absolute) / scale
+
+
+def decision_probabilities(oos, levels=None, sigma=1.0, absolute=None, suffix=''):
     """Model probability and realised outcome for each decision task.
 
-    ``sigma`` sets how far the touch and big-move thresholds sit from spot, in
-    units of the volatility scale used to normalise the labels -- so 1.0 is a
-    one-standard-deviation move over the horizon.
+    ``sigma`` places the touch and big-move thresholds in units of the
+    volatility scale; pass ``absolute`` instead for a fixed return threshold
+    (see :func:`thresholds_in_scaled_space` for why that is usually better).
     """
     levels = tuple(levels or oos.attrs.get('levels', DEFAULT_LEVELS))
     dists = _distributions(oos, levels, suffix=suffix)
@@ -193,23 +211,63 @@ def decision_probabilities(oos, levels=None, sigma=1.0, suffix=''):
         raise ValueError('out-of-sample frame carries no quantile columns')
 
     truth = {t: oos[f'{t}_z_true'].to_numpy(dtype=float) for t in ('mfe', 'mae', 'ret')}
+    cut = thresholds_in_scaled_space(oos, sigma=sigma, absolute=absolute)
     n = len(oos)
     probability, outcome = {}, {}
 
     probability['direction'] = np.array([1.0 - dists['ret'][i].cdf(0.0) for i in range(n)])
     outcome['direction'] = truth['ret'] > 0
 
-    probability['upside_touch'] = np.array([1.0 - dists['mfe'][i].cdf(sigma) for i in range(n)])
-    outcome['upside_touch'] = truth['mfe'] >= sigma
+    probability['upside_touch'] = np.array(
+        [1.0 - dists['mfe'][i].cdf(cut[i]) for i in range(n)])
+    outcome['upside_touch'] = truth['mfe'] >= cut
 
-    probability['downside_touch'] = np.array([dists['mae'][i].cdf(-sigma) for i in range(n)])
-    outcome['downside_touch'] = truth['mae'] <= -sigma
+    probability['downside_touch'] = np.array(
+        [dists['mae'][i].cdf(-cut[i]) for i in range(n)])
+    outcome['downside_touch'] = truth['mae'] <= -cut
 
     probability['big_move'] = np.array([
-        (1.0 - dists['ret'][i].cdf(sigma)) + dists['ret'][i].cdf(-sigma) for i in range(n)])
-    outcome['big_move'] = np.abs(truth['ret']) >= sigma
+        (1.0 - dists['ret'][i].cdf(cut[i])) + dists['ret'][i].cdf(-cut[i])
+        for i in range(n)])
+    outcome['big_move'] = np.abs(truth['ret']) >= cut
 
     return probability, outcome
+
+
+def random_walk_probabilities(oos, sigma=1.0, absolute=None, horizon=None):
+    """Same-volatility random-walk probabilities for each task.
+
+    This is the benchmark that neutralises "I can see volatility is high right
+    now": it is handed the current volatility estimate and asked the same
+    question.  Beating it requires information beyond the volatility level.
+
+    Note it goes nearly flat for a sigma-scaled threshold: when the cut-off
+    and the volatility scale move together, the random-walk answer is very
+    nearly the same on every bar (standard deviation around 0.011, against
+    0.19 for a fixed 5% threshold), leaving it almost nothing to rank on.
+    That collapse is the tell that a sigma-scaled task is asking about the
+    estimator rather than about the asset.
+    """
+    horizon = horizon or oos.attrs.get('horizon')
+    if not horizon:
+        raise ValueError('horizon is unknown; pass it explicitly')
+
+    scale = oos['scale'].to_numpy(dtype=float)
+    sigma_daily = scale / np.sqrt(horizon)
+    if absolute is None:
+        moves = sigma * scale          # a sigma-sized move, in return terms
+    else:
+        moves = np.full(len(oos), float(absolute))
+
+    up, down, big = [], [], []
+    for move, vol in zip(moves, sigma_daily):
+        up.append(gbm_touch_probability(move, vol, horizon, kind='up'))
+        down.append(gbm_touch_probability(-move, vol, horizon, kind='down'))
+        big.append(gbm_move_probability(move, vol, horizon))
+    return {'direction': np.full(len(oos), 0.5),   # driftless: no view
+            'upside_touch': np.array(up),
+            'downside_touch': np.array(down),
+            'big_move': np.array(big)}
 
 
 def resolve_threshold(probabilities, threshold='auto'):
@@ -229,8 +287,8 @@ def resolve_threshold(probabilities, threshold='auto'):
     return float(threshold)
 
 
-def classification_report(oos, levels=None, sigma=1.0, threshold='auto',
-                          include_baseline=True):
+def classification_report(oos, levels=None, sigma=1.0, absolute=None,
+                          threshold='auto', include_baseline=True):
     """Confusion matrices and scores for every decision task.
 
     Returns ``{task: {...}}`` with the confusion frame, the scores, the
@@ -238,17 +296,24 @@ def classification_report(oos, levels=None, sigma=1.0, threshold='auto',
     comparison is like for like.  Each side is cut at its own ``'auto'``
     threshold, so both are asked the same question about their own beliefs.
     """
-    model_prob, outcome = decision_probabilities(oos, levels=levels, sigma=sigma)
+    model_prob, outcome = decision_probabilities(oos, levels=levels, sigma=sigma,
+                                                 absolute=absolute)
     base_prob = (decision_probabilities(oos, levels=levels, sigma=sigma,
-                                        suffix='_base')[0]
+                                        absolute=absolute, suffix='_base')[0]
                  if include_baseline else {})
+    try:
+        walk_prob = (random_walk_probabilities(oos, sigma=sigma, absolute=absolute)
+                     if include_baseline else {})
+    except ValueError:
+        walk_prob = {}
 
     report = {}
     for task in TASKS:
         labels = TASK_LABELS[task]
         cut = resolve_threshold(model_prob[task], threshold)
         entry = {
-            'question': TASK_QUESTIONS[task].format(t=sigma),
+            'question': TASK_QUESTIONS[task].format(
+                t=f'{absolute:.1%}' if absolute is not None else f'{sigma} sigma'),
             'threshold': cut,
             'confusion': binary_confusion(outcome[task], model_prob[task],
                                           labels=labels, threshold=cut),
@@ -261,6 +326,10 @@ def classification_report(oos, levels=None, sigma=1.0, threshold='auto',
                 outcome[task], base_prob[task], labels=labels, threshold=base_cut)
             entry['baseline_scores'] = binary_scores(
                 outcome[task], base_prob[task], base_cut)
+        if task in walk_prob:
+            entry['random_walk_scores'] = binary_scores(
+                outcome[task], walk_prob[task],
+                resolve_threshold(walk_prob[task], threshold))
         report[task] = entry
     return report
 
@@ -286,6 +355,9 @@ def summarise_report(report):
         baseline = entry.get('baseline_scores') or {}
         row['baseline_roc_auc'] = baseline.get('roc_auc', float('nan'))
         row['baseline_brier'] = baseline.get('brier', float('nan'))
+        walk = entry.get('random_walk_scores') or {}
+        row['randomwalk_roc_auc'] = walk.get('roc_auc', float('nan'))
+        row['randomwalk_brier'] = walk.get('brier', float('nan'))
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -306,7 +378,10 @@ def classification_verdict(report):
     # Beating a coin toss is not the bar: climatology is, exactly as for the
     # quantile scores.  A constant forecast still earns an AUC away from 0.5
     # when the base rate drifts between folds, so that is what must be cleared.
-    floor = np.maximum(0.52, summary['baseline_roc_auc'].fillna(0.5) + 0.01)
+    # The model has to clear whichever reference is harder: training-window
+    # climatology, or a random walk that already knows today's volatility.
+    toughest = summary[['baseline_roc_auc', 'randomwalk_roc_auc']].max(axis=1)
+    floor = np.maximum(0.52, toughest.fillna(0.5) + 0.01)
     informative = summary[summary['roc_auc'] > floor]
 
     if informative.empty:
@@ -324,9 +399,15 @@ def classification_verdict(report):
             notes.append(f'{task}: only one class occurred, nothing to score')
             continue
 
+        walk_auc = row['randomwalk_roc_auc']
         if auc <= 0.5:
             notes.append(f'{task}: the ranking is no better than a coin toss '
                          f'(AUC {auc:.2f}) -- do not trade this decision')
+        elif np.isfinite(walk_auc) and auc <= walk_auc:
+            notes.append(f'{task}: a random walk that knows only today\'s '
+                         f'volatility ranks it as well (AUC {walk_auc:.2f} vs '
+                         f'{auc:.2f}) -- the forecast adds nothing to knowing '
+                         'the volatility level')
         elif np.isfinite(base_auc) and auc <= base_auc:
             notes.append(f'{task}: climatology ranks it at least as well '
                          f'(AUC {base_auc:.2f} vs {auc:.2f}) -- the features '
